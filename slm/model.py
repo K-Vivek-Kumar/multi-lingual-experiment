@@ -1,169 +1,245 @@
 import torch
 import torch.nn as nn
-import math
+
+
+class GELU(nn.Module):
+    def __init__(self):
+        super().__init__()
+
+    def forward(self, x):
+        return (
+            0.5
+            * x
+            * (
+                1
+                + torch.tanh(
+                    torch.sqrt(torch.tensor(2.0 / torch.pi))
+                    * (x + 0.044715 * torch.pow(x, 3))
+                )
+            )
+        )
+
+
+class LayerNorm(nn.Module):
+    def __init__(self, emb_dim):
+        super().__init__()
+        self.eps = 1e-5
+        self.scale = nn.Parameter(torch.ones(emb_dim))
+        self.shift = nn.Parameter(torch.zeros(emb_dim))
+
+    def forward(self, x):
+        mean = x.mean(dim=-1, keepdim=True)
+        var = x.var(dim=-1, keepdim=True, unbiased=False)
+        norm_x = (x - mean) / torch.sqrt(var + self.eps)
+        return self.scale * norm_x + self.shift
+
+
+class FeedForward(nn.Module):
+    def __init__(self, cfg):
+        super().__init__()
+        self.layers = nn.Sequential(
+            nn.Linear(cfg["emb_dim"], 4 * cfg["emb_dim"]),
+            GELU(),
+            nn.Linear(4 * cfg["emb_dim"], cfg["emb_dim"]),
+        )
+
+    def forward(self, x):
+        return self.layers(x)
 
 
 class MultiHeadAttention(nn.Module):
-    def __init__(self, d_model, num_heads):
-        super(MultiHeadAttention, self).__init__()
-        assert d_model % num_heads == 0, "d_model must be divisible by num_heads"
+    def __init__(self, d_in, d_out, context_length, dropout, num_heads, qkv_bias=False):
+        super().__init__()
+        assert d_out % num_heads == 0, "d_out must be divisible by num_heads"
 
-        self.d_model = d_model
+        self.d_out = d_out
         self.num_heads = num_heads
-        self.d_k = d_model // num_heads
+        self.head_dim = d_out // num_heads
 
-        self.W_q = nn.Linear(d_model, d_model)
-        self.W_k = nn.Linear(d_model, d_model)
-        self.W_v = nn.Linear(d_model, d_model)
-        self.W_o = nn.Linear(d_model, d_model)
-
-    def scaled_dot_product_attention(self, Q, K, V, mask=None):
-        attn_scores = torch.matmul(Q, K.transpose(-2, -1)) / math.sqrt(self.d_k)
-        if mask is not None:
-            attn_scores = attn_scores.masked_fill(mask == 0, -1e9)
-        attn_probs = torch.softmax(attn_scores, dim=-1)
-        output = torch.matmul(attn_probs, V)
-        return output
-
-    def split_heads(self, x):
-        batch_size, seq_length, d_model = x.size()
-        return x.view(batch_size, seq_length, self.num_heads, self.d_k).transpose(1, 2)
-
-    def combine_heads(self, x):
-        batch_size, _, seq_length, d_k = x.size()
-        return x.transpose(1, 2).contiguous().view(batch_size, seq_length, self.d_model)
-
-    def forward(self, Q, K, V, mask=None):
-        Q = self.split_heads(self.W_q(Q))
-        K = self.split_heads(self.W_k(K))
-        V = self.split_heads(self.W_v(V))
-
-        attn_output = self.scaled_dot_product_attention(Q, K, V, mask)
-        output = self.W_o(self.combine_heads(attn_output))
-        return output
-
-
-class PositionWiseFeedForward(nn.Module):
-    def __init__(self, d_model, d_ff):
-        super(PositionWiseFeedForward, self).__init__()
-        self.fc1 = nn.Linear(d_model, d_ff)
-        self.fc2 = nn.Linear(d_ff, d_model)
-        self.relu = nn.ReLU()
-
-    def forward(self, x):
-        return self.fc2(self.relu(self.fc1(x)))
-
-
-class PositionalEncoding(nn.Module):
-    def __init__(self, d_model, max_seq_length):
-        super(PositionalEncoding, self).__init__()
-
-        pe = torch.zeros(max_seq_length, d_model)
-        position = torch.arange(0, max_seq_length, dtype=torch.float).unsqueeze(1)
-        div_term = torch.exp(
-            torch.arange(0, d_model, 2).float() * -(math.log(10000.0) / d_model)
+        self.W_query = nn.Linear(d_in, d_out, bias=qkv_bias)
+        self.W_key = nn.Linear(d_in, d_out, bias=qkv_bias)
+        self.W_value = nn.Linear(d_in, d_out, bias=qkv_bias)
+        self.out_proj = nn.Linear(d_out, d_out)
+        self.dropout = nn.Dropout(dropout)
+        self.register_buffer(
+            "mask", torch.triu(torch.ones(context_length, context_length), diagonal=1)
         )
 
-        pe[:, 0::2] = torch.sin(position * div_term)
-        pe[:, 1::2] = torch.cos(position * div_term)
+    def forward(self, x):
+        b, num_tokens, d_in = x.shape
 
-        self.register_buffer("pe", pe.unsqueeze(0))
+        keys = self.W_key(x)
+        queries = self.W_query(x)
+        values = self.W_value(x)
+
+        keys = keys.view(b, num_tokens, self.num_heads, self.head_dim)
+        values = values.view(b, num_tokens, self.num_heads, self.head_dim)
+        queries = queries.view(b, num_tokens, self.num_heads, self.head_dim)
+
+        keys = keys.transpose(1, 2)
+        queries = queries.transpose(1, 2)
+        values = values.transpose(1, 2)
+
+        attn_scores = queries @ keys.transpose(2, 3)
+
+        mask_bool = self.mask.bool()[:num_tokens, :num_tokens]
+
+        attn_scores.masked_fill_(mask_bool, -torch.inf)
+
+        attn_weights = torch.softmax(attn_scores / keys.shape[-1] ** 0.5, dim=-1)
+        attn_weights = self.dropout(attn_weights)
+
+        context_vec = (attn_weights @ values).transpose(1, 2)
+
+        context_vec = context_vec.contiguous().view(b, num_tokens, self.d_out)
+        context_vec = self.out_proj(context_vec)
+
+        return context_vec
+
+
+class EncoderBlock(nn.Module):
+    def __init__(self, cfg):
+        super().__init__()
+        self.att = MultiHeadAttention(
+            d_in=cfg["emb_dim"],
+            d_out=cfg["emb_dim"],
+            context_length=cfg["context_length"],
+            num_heads=cfg["n_heads"],
+            dropout=cfg["drop_rate"],
+            qkv_bias=cfg["qkv_bias"],
+        )
+        self.ff = FeedForward(cfg)
+        self.norm1 = LayerNorm(cfg["emb_dim"])
+        self.norm2 = LayerNorm(cfg["emb_dim"])
+        self.drop_shortcut = nn.Dropout(cfg["drop_rate"])
 
     def forward(self, x):
-        return x + self.pe[:, : x.size(1)]
+        shortcut = x
+        x = self.norm1(x)
+        x = self.att(x)
+        x = self.drop_shortcut(x)
+        x = x + shortcut
 
+        shortcut = x
+        x = self.norm2(x)
+        x = self.ff(x)
+        x = self.drop_shortcut(x)
+        x = x + shortcut
 
-class EncoderLayer(nn.Module):
-    def __init__(self, d_model, num_heads, d_ff, dropout):
-        super(EncoderLayer, self).__init__()
-        self.self_attn = MultiHeadAttention(d_model, num_heads)
-        self.feed_forward = PositionWiseFeedForward(d_model, d_ff)
-        self.norm1 = nn.LayerNorm(d_model)
-        self.norm2 = nn.LayerNorm(d_model)
-        self.dropout = nn.Dropout(dropout)
-
-    def forward(self, x, mask):
-        attn_output = self.self_attn(x, x, x, mask)
-        x = self.norm1(x + self.dropout(attn_output))
-        ff_output = self.feed_forward(x)
-        x = self.norm2(x + self.dropout(ff_output))
         return x
 
 
-class DecoderLayer(nn.Module):
-    def __init__(self, d_model, num_heads, d_ff, dropout):
-        super(DecoderLayer, self).__init__()
-        self.self_attn = MultiHeadAttention(d_model, num_heads)
-        self.cross_attn = MultiHeadAttention(d_model, num_heads)
-        self.feed_forward = PositionWiseFeedForward(d_model, d_ff)
-        self.norm1 = nn.LayerNorm(d_model)
-        self.norm2 = nn.LayerNorm(d_model)
-        self.norm3 = nn.LayerNorm(d_model)
-        self.dropout = nn.Dropout(dropout)
+class DecoderBlock(nn.Module):
+    def __init__(self, cfg):
+        super().__init__()
+        self.self_att = MultiHeadAttention(
+            d_in=cfg["emb_dim"],
+            d_out=cfg["emb_dim"],
+            context_length=cfg["context_length"],
+            num_heads=cfg["n_heads"],
+            dropout=cfg["drop_rate"],
+            qkv_bias=cfg["qkv_bias"],
+        )
+        self.cross_att = MultiHeadAttention(
+            d_in=cfg["emb_dim"],
+            d_out=cfg["emb_dim"],
+            context_length=cfg["context_length"],
+            num_heads=cfg["n_heads"],
+            dropout=cfg["drop_rate"],
+            qkv_bias=cfg["qkv_bias"],
+        )
+        self.ff = FeedForward(cfg)
+        self.norm1 = LayerNorm(cfg["emb_dim"])
+        self.norm2 = LayerNorm(cfg["emb_dim"])
+        self.norm3 = LayerNorm(cfg["emb_dim"])
+        self.drop_shortcut = nn.Dropout(cfg["drop_rate"])
 
-    def forward(self, x, enc_output, src_mask, tgt_mask):
-        attn_output = self.self_attn(x, x, x, tgt_mask)
-        x = self.norm1(x + self.dropout(attn_output))
-        attn_output = self.cross_attn(x, enc_output, enc_output, src_mask)
-        x = self.norm2(x + self.dropout(attn_output))
-        ff_output = self.feed_forward(x)
-        x = self.norm3(x + self.dropout(ff_output))
+    def forward(self, x, encoder_outputs):
+        shortcut = x
+        x = self.norm1(x)
+        x = self.self_att(x)
+        x = self.drop_shortcut(x)
+        x = x + shortcut
+
+        shortcut = x
+        x = self.norm2(x)
+        x = self.cross_att(x + encoder_outputs)
+        x = self.drop_shortcut(x)
+        x = x + shortcut
+
+        shortcut = x
+        x = self.norm3(x)
+        x = self.ff(x)
+        x = self.drop_shortcut(x)
+        x = x + shortcut
+
         return x
 
 
-class Transformer(nn.Module):
-    def __init__(
-        self,
-        src_vocab_size,
-        tgt_vocab_size,
-        d_model,
-        num_heads,
-        num_layers,
-        d_ff,
-        max_seq_length,
-        dropout,
-    ):
-        super(Transformer, self).__init__()
-        self.encoder_embedding = nn.Embedding(src_vocab_size, d_model)
-        self.decoder_embedding = nn.Embedding(tgt_vocab_size, d_model)
-        self.positional_encoding = PositionalEncoding(d_model, max_seq_length)
-
-        self.encoder_layers = nn.ModuleList(
-            [EncoderLayer(d_model, num_heads, d_ff, dropout) for _ in range(num_layers)]
+class TransformerBlock(nn.Module):
+    def __init__(self, cfg):
+        super().__init__()
+        self.encoder_tok_emb = nn.Embedding(cfg["vocab_size"], cfg["emb_dim"])
+        self.encoder_pos_emb = nn.Embedding(cfg["context_length"], cfg["emb_dim"])
+        self.encoder_blocks = nn.Sequential(
+            *[EncoderBlock(cfg) for _ in range(cfg["n_layers"])]
         )
-        self.decoder_layers = nn.ModuleList(
-            [DecoderLayer(d_model, num_heads, d_ff, dropout) for _ in range(num_layers)]
+        self.encoder_norm = LayerNorm(cfg["emb_dim"])
+
+        self.decoder_tok_emb = nn.Embedding(cfg["vocab_size"], cfg["emb_dim"])
+        self.decoder_pos_emb = nn.Embedding(cfg["context_length"], cfg["emb_dim"])
+        self.decoder_blocks = nn.Sequential(
+            *[DecoderBlock(cfg) for _ in range(cfg["n_layers"])]
+        )
+        self.decoder_norm = LayerNorm(cfg["emb_dim"])
+        self.out_head = nn.Linear(cfg["emb_dim"], cfg["vocab_size"], bias=False)
+
+        self.drop_emb = nn.Dropout(cfg["drop_rate"])
+
+    def forward(self, src_idx, tgt_idx):
+        src_tok_emb = self.encoder_tok_emb(src_idx)
+        src_pos_emb = self.encoder_pos_emb(
+            torch.arange(src_idx.size(1), device=src_idx.device)
+        )
+        encoder_input = self.drop_emb(src_tok_emb + src_pos_emb)
+        encoder_outputs = self.encoder_blocks(encoder_input)
+        encoder_outputs = self.encoder_norm(encoder_outputs)
+
+        tgt_tok_emb = self.decoder_tok_emb(tgt_idx)
+        tgt_pos_emb = self.decoder_pos_emb(
+            torch.arange(tgt_idx.size(1), device=tgt_idx.device)
+        )
+        decoder_input = self.drop_emb(tgt_tok_emb + tgt_pos_emb)
+        decoder_outputs = decoder_input
+        for block in self.decoder_blocks:
+            decoder_outputs = block(decoder_outputs, encoder_outputs)
+
+        decoder_outputs = self.decoder_norm(decoder_outputs)
+        logits = self.out_head(decoder_outputs)
+        return logits
+
+
+class GPTModel(nn.Module):
+    def __init__(self, cfg):
+        super().__init__()
+        self.tok_emb = nn.Embedding(cfg["vocab_size"], cfg["emb_dim"])
+        self.pos_emb = nn.Embedding(cfg["context_length"], cfg["emb_dim"])
+        self.drop_emb = nn.Dropout(cfg["drop_rate"])
+
+        self.trf_blocks = nn.Sequential(
+            *[TransformerBlock(cfg) for _ in range(cfg["n_layers"])]
         )
 
-        self.fc = nn.Linear(d_model, tgt_vocab_size)
-        self.dropout = nn.Dropout(dropout)
+        self.final_norm = LayerNorm(cfg["emb_dim"])
+        self.out_head = nn.Linear(cfg["emb_dim"], cfg["vocab_size"], bias=False)
 
-    def generate_mask(self, src, tgt):
-        src_mask = (src != 0).unsqueeze(1).unsqueeze(2)
-        tgt_mask = (tgt != 0).unsqueeze(1).unsqueeze(3)
-        seq_length = tgt.size(1)
-        nopeak_mask = (
-            1 - torch.triu(torch.ones(1, seq_length, seq_length), diagonal=1)
-        ).bool()
-        tgt_mask = tgt_mask & nopeak_mask
-        return src_mask, tgt_mask
-
-    def forward(self, src, tgt):
-        src_mask, tgt_mask = self.generate_mask(src, tgt)
-        src_embedded = self.dropout(
-            self.positional_encoding(self.encoder_embedding(src))
-        )
-        tgt_embedded = self.dropout(
-            self.positional_encoding(self.decoder_embedding(tgt))
-        )
-
-        enc_output = src_embedded
-        for enc_layer in self.encoder_layers:
-            enc_output = enc_layer(enc_output, src_mask)
-
-        dec_output = tgt_embedded
-        for dec_layer in self.decoder_layers:
-            dec_output = dec_layer(dec_output, enc_output, src_mask, tgt_mask)
-
-        output = self.fc(dec_output)
-        return output
+    def forward(self, in_idx):
+        batch_size, seq_len = in_idx.shape
+        tok_embeds = self.tok_emb(in_idx)
+        pos_embeds = self.pos_emb(torch.arange(seq_len, device=in_idx.device))
+        x = tok_embeds + pos_embeds
+        x = self.drop_emb(x)
+        x = self.trf_blocks(x)
+        x = self.final_norm(x)
+        logits = self.out_head(x)
+        return logits
