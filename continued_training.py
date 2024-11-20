@@ -88,17 +88,16 @@ if __name__ == "__main__":
     with open(file_path, "r", encoding="utf-8") as file:
         text_data = file.read()
 
-    # Resume training
     train_losses, val_losses, tokens_seen, model = continue_training(
-        saved_model_path="model.pth",
+        saved_model_path="trained_transformer_model.pth",
         gpt_config=GPT_CONFIG_124M,
         new_settings=CONTINUE_SETTINGS,
         text_data=text_data,
         additional_epochs=5,
-        start_context="The future belongs to those",
+        start_context="Turtle and Rabbit Story",
     )
 
-    torch.save(model.state_dict(), "model.pth")
+    torch.save(model.state_dict(), "trained_transformer_model.pth")
 
     epochs_tensor = torch.linspace(0, len(train_losses), len(train_losses))
     plot_losses(epochs_tensor, tokens_seen, train_losses, val_losses)

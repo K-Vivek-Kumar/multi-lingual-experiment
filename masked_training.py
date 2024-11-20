@@ -134,7 +134,7 @@ if __name__ == "__main__":
     }
 
     pretrained_model_path = "trained_transformer_model.pth"
-    text_file_path = "the-verdict.txt"
+    text_file_path = "facts.txt"
 
     main_with_masking(
         pretrained_model_path, text_file_path, GPT_CONFIG_124M, OTHER_SETTINGS

@@ -97,7 +97,7 @@ class MultiHeadAttention(nn.Module):
         return context_vec
 
 
-class EncoderBlock(nn.Module):
+class TransformerBlock(nn.Module):
     def __init__(self, cfg):
         super().__init__()
         self.att = MultiHeadAttention(
@@ -114,6 +114,7 @@ class EncoderBlock(nn.Module):
         self.drop_shortcut = nn.Dropout(cfg["drop_rate"])
 
     def forward(self, x):
+
         shortcut = x
         x = self.norm1(x)
         x = self.att(x)
@@ -127,96 +128,6 @@ class EncoderBlock(nn.Module):
         x = x + shortcut
 
         return x
-
-
-class DecoderBlock(nn.Module):
-    def __init__(self, cfg):
-        super().__init__()
-        self.self_att = MultiHeadAttention(
-            d_in=cfg["emb_dim"],
-            d_out=cfg["emb_dim"],
-            context_length=cfg["context_length"],
-            num_heads=cfg["n_heads"],
-            dropout=cfg["drop_rate"],
-            qkv_bias=cfg["qkv_bias"],
-        )
-        self.cross_att = MultiHeadAttention(
-            d_in=cfg["emb_dim"],
-            d_out=cfg["emb_dim"],
-            context_length=cfg["context_length"],
-            num_heads=cfg["n_heads"],
-            dropout=cfg["drop_rate"],
-            qkv_bias=cfg["qkv_bias"],
-        )
-        self.ff = FeedForward(cfg)
-        self.norm1 = LayerNorm(cfg["emb_dim"])
-        self.norm2 = LayerNorm(cfg["emb_dim"])
-        self.norm3 = LayerNorm(cfg["emb_dim"])
-        self.drop_shortcut = nn.Dropout(cfg["drop_rate"])
-
-    def forward(self, x, encoder_outputs):
-        shortcut = x
-        x = self.norm1(x)
-        x = self.self_att(x)
-        x = self.drop_shortcut(x)
-        x = x + shortcut
-
-        shortcut = x
-        x = self.norm2(x)
-        x = self.cross_att(x + encoder_outputs)
-        x = self.drop_shortcut(x)
-        x = x + shortcut
-
-        shortcut = x
-        x = self.norm3(x)
-        x = self.ff(x)
-        x = self.drop_shortcut(x)
-        x = x + shortcut
-
-        return x
-
-
-class TransformerBlock(nn.Module):
-    def __init__(self, cfg):
-        super().__init__()
-        self.encoder_tok_emb = nn.Embedding(cfg["vocab_size"], cfg["emb_dim"])
-        self.encoder_pos_emb = nn.Embedding(cfg["context_length"], cfg["emb_dim"])
-        self.encoder_blocks = nn.Sequential(
-            *[EncoderBlock(cfg) for _ in range(cfg["n_layers"])]
-        )
-        self.encoder_norm = LayerNorm(cfg["emb_dim"])
-
-        self.decoder_tok_emb = nn.Embedding(cfg["vocab_size"], cfg["emb_dim"])
-        self.decoder_pos_emb = nn.Embedding(cfg["context_length"], cfg["emb_dim"])
-        self.decoder_blocks = nn.Sequential(
-            *[DecoderBlock(cfg) for _ in range(cfg["n_layers"])]
-        )
-        self.decoder_norm = LayerNorm(cfg["emb_dim"])
-        self.out_head = nn.Linear(cfg["emb_dim"], cfg["vocab_size"], bias=False)
-
-        self.drop_emb = nn.Dropout(cfg["drop_rate"])
-
-    def forward(self, src_idx, tgt_idx):
-        src_tok_emb = self.encoder_tok_emb(src_idx)
-        src_pos_emb = self.encoder_pos_emb(
-            torch.arange(src_idx.size(1), device=src_idx.device)
-        )
-        encoder_input = self.drop_emb(src_tok_emb + src_pos_emb)
-        encoder_outputs = self.encoder_blocks(encoder_input)
-        encoder_outputs = self.encoder_norm(encoder_outputs)
-
-        tgt_tok_emb = self.decoder_tok_emb(tgt_idx)
-        tgt_pos_emb = self.decoder_pos_emb(
-            torch.arange(tgt_idx.size(1), device=tgt_idx.device)
-        )
-        decoder_input = self.drop_emb(tgt_tok_emb + tgt_pos_emb)
-        decoder_outputs = decoder_input
-        for block in self.decoder_blocks:
-            decoder_outputs = block(decoder_outputs, encoder_outputs)
-
-        decoder_outputs = self.decoder_norm(decoder_outputs)
-        logits = self.out_head(decoder_outputs)
-        return logits
 
 
 class GPTModel(nn.Module):
