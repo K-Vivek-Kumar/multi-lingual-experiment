@@ -1,289 +1,200 @@
+import argparse
 import matplotlib.pyplot as plt
 import os
 import torch
-import urllib.request
 import tiktoken
-from torch.utils.data import Dataset, DataLoader
+from torch.utils.data import DataLoader
 
-from slm.model import GPTModel
-
-
-def generate_text_simple(model, idx, max_new_tokens, context_size):
-    for _ in range(max_new_tokens):
-        idx_cond = idx[:, -context_size:]
-
-        with torch.no_grad():
-            logits = model(idx_cond)
-
-        logits = logits[:, -1, :]
-
-        probas = torch.softmax(logits, dim=-1)
-
-        idx_next = torch.argmax(probas, dim=-1, keepdim=True)
-
-        idx = torch.cat((idx, idx_next), dim=1)
-
-    return idx
+from config import MODEL_PARAMETERS, MODEL_TOKENS, TRAINING_PARAMETERS
+from slm.model import LanguageModel
+from slm.tokenizer import TokenizedTextDataset, decode_tokens, encode_text
+from slm.generation import generate_text
 
 
-class GPTDatasetV1(Dataset):
-    def __init__(self, txt, tokenizer, max_length, stride):
-        self.input_ids = []
-        self.target_ids = []
-
-        token_ids = tokenizer.encode(txt, allowed_special={"<|endoftext|>"})
-
-        for i in range(0, len(token_ids) - max_length, stride):
-            input_chunk = token_ids[i : i + max_length]
-            target_chunk = token_ids[i + 1 : i + max_length + 1]
-            self.input_ids.append(torch.tensor(input_chunk))
-            self.target_ids.append(torch.tensor(target_chunk))
-
-    def __len__(self):
-        return len(self.input_ids)
-
-    def __getitem__(self, idx):
-        return self.input_ids[idx], self.target_ids[idx]
+def parse_arguments():
+    parser = argparse.ArgumentParser(description="Train")
+    parser.add_argument(
+        "--input_data",
+        type=str,
+        required=True,
+        help="Path to the input text file for training the language model.",
+    )
+    parser.add_argument(
+        "--epochs",
+        type=int,
+        required=False,
+        help="Number of Epochs",
+    )
+    return parser.parse_args()
 
 
-def create_dataloader_v1(
-    txt,
-    batch_size=4,
-    max_length=256,
-    stride=128,
-    shuffle=True,
-    drop_last=True,
-    num_workers=0,
+def create_dataloader(
+    text, batch_size, seq_length, step_size, shuffle_data, drop_extra, num_workers
 ):
-
-    tokenizer = tiktoken.get_encoding("gpt2")
-
-    dataset = GPTDatasetV1(txt, tokenizer, max_length, stride)
-
-    dataloader = DataLoader(
+    tokenizer = tiktoken.get_encoding(MODEL_TOKENS)
+    dataset = TokenizedTextDataset(text, tokenizer, seq_length, step_size)
+    return DataLoader(
         dataset,
         batch_size=batch_size,
-        shuffle=shuffle,
-        drop_last=drop_last,
+        shuffle=shuffle_data,
+        drop_last=drop_extra,
         num_workers=num_workers,
     )
 
-    return dataloader
 
-
-def text_to_token_ids(text, tokenizer):
-    encoded = tokenizer.encode(text)
-    encoded_tensor = torch.tensor(encoded).unsqueeze(0)
-    return encoded_tensor
-
-
-def token_ids_to_text(token_ids, tokenizer):
-    flat = token_ids.squeeze(0)
-    return tokenizer.decode(flat.tolist())
-
-
-def calc_loss_batch(input_batch, target_batch, model, device):
-    input_batch, target_batch = input_batch.to(device), target_batch.to(device)
-    logits = model(input_batch)
-    loss = torch.nn.functional.cross_entropy(
-        logits.flatten(0, 1), target_batch.flatten()
+def compute_loss(inputs, targets, model, device):
+    inputs, targets = inputs.to(device), targets.to(device)
+    predictions = model(inputs)
+    return torch.nn.functional.cross_entropy(
+        predictions.flatten(0, 1), targets.flatten()
     )
-    return loss
 
 
-def calc_loss_loader(data_loader, model, device, num_batches=None):
+def evaluate_loss(data_loader, model, device, max_batches=None):
     total_loss = 0.0
-    if len(data_loader) == 0:
-        return float("nan")
-    elif num_batches is None:
-        num_batches = len(data_loader)
-    else:
-        num_batches = min(num_batches, len(data_loader))
-    for i, (input_batch, target_batch) in enumerate(data_loader):
-        if i < num_batches:
-            loss = calc_loss_batch(input_batch, target_batch, model, device)
-            total_loss += loss.item()
-        else:
+    max_batches = max_batches or len(data_loader)
+    for batch_index, (inputs, targets) in enumerate(data_loader):
+        if batch_index >= max_batches:
             break
-    return total_loss / num_batches
+        total_loss += compute_loss(inputs, targets, model, device).item()
+    return total_loss / max_batches
 
 
-def evaluate_model(model, train_loader, val_loader, device, eval_iter):
+def evaluate_model(model, train_loader, val_loader, device, max_batches):
     model.eval()
     with torch.no_grad():
-        train_loss = calc_loss_loader(
-            train_loader, model, device, num_batches=eval_iter
-        )
-        val_loss = calc_loss_loader(val_loader, model, device, num_batches=eval_iter)
+        train_loss = evaluate_loss(train_loader, model, device, max_batches)
+        val_loss = evaluate_loss(val_loader, model, device, max_batches)
     model.train()
     return train_loss, val_loss
 
 
-def generate_and_print_sample(model, tokenizer, device, start_context):
+def generate_sample_text(model, tokenizer, device, initial_text):
     model.eval()
-    context_size = model.pos_emb.weight.shape[0]
-    encoded = text_to_token_ids(start_context, tokenizer).to(device)
+    context_limit = model.pos_emb.weight.shape[0]
+    context_indices = encode_text(initial_text, tokenizer).to(device)
     with torch.no_grad():
-        token_ids = generate_text_simple(
-            model=model, idx=encoded, max_new_tokens=50, context_size=context_size
+        generated_tokens = generate_text(
+            model, context_indices, max_new_tokens=50, context_size=context_limit
         )
-        decoded_text = token_ids_to_text(token_ids, tokenizer)
-        print(decoded_text.replace("\n", " "))
+        print(decode_tokens(generated_tokens, tokenizer).replace("\n", " "))
     model.train()
 
 
-def train_model_simple(
+def train_model(
     model,
     train_loader,
     val_loader,
     optimizer,
     device,
-    num_epochs,
-    eval_freq,
-    eval_iter,
-    start_context,
+    epochs,
+    eval_interval,
+    max_batches,
+    initial_text,
     tokenizer,
 ):
+    train_losses, val_losses, tokens_processed = [], [], []
+    total_tokens, steps = 0, 0
 
-    train_losses, val_losses, track_tokens_seen = [], [], []
-    tokens_seen = 0
-    global_step = -1
-
-    for epoch in range(num_epochs):
-        model.train()
-
-        for input_batch, target_batch in train_loader:
+    for epoch in range(epochs):
+        for inputs, targets in train_loader:
             optimizer.zero_grad()
-            loss = calc_loss_batch(input_batch, target_batch, model, device)
+            loss = compute_loss(inputs, targets, model, device)
             loss.backward()
             optimizer.step()
-            tokens_seen += input_batch.numel()
-            global_step += 1
-
-            if global_step % eval_freq == 0:
+            total_tokens += inputs.numel()
+            steps += 1
+            if steps % eval_interval == 0:
                 train_loss, val_loss = evaluate_model(
-                    model, train_loader, val_loader, device, eval_iter
+                    model, train_loader, val_loader, device, max_batches
                 )
                 train_losses.append(train_loss)
                 val_losses.append(val_loss)
-                track_tokens_seen.append(tokens_seen)
+                tokens_processed.append(total_tokens)
                 print(
-                    f"Ep {epoch+1} (Step {global_step:06d}): "
-                    f"Train loss {train_loss:.3f}, Val loss {val_loss:.3f}"
+                    f"Epoch {epoch + 1}, Step {steps}: "
+                    f"Train Loss {train_loss:.3f}, Val Loss {val_loss:.3f}"
                 )
+        generate_sample_text(model, tokenizer, device, initial_text)
 
-        generate_and_print_sample(model, tokenizer, device, start_context)
-
-    return train_losses, val_losses, track_tokens_seen
+    return train_losses, val_losses, tokens_processed
 
 
-def plot_losses(epochs_seen, tokens_seen, train_losses, val_losses):
+def plot_training_results(epochs, tokens, train_losses, val_losses):
     fig, ax1 = plt.subplots()
-
-    ax1.plot(epochs_seen, train_losses, label="Training loss")
-    ax1.plot(epochs_seen, val_losses, linestyle="-.", label="Validation loss")
+    ax1.plot(epochs, train_losses, label="Train Loss")
+    ax1.plot(epochs, val_losses, linestyle="-.", label="Val Loss")
     ax1.set_xlabel("Epochs")
     ax1.set_ylabel("Loss")
     ax1.legend(loc="upper right")
-
     ax2 = ax1.twiny()
-    ax2.plot(tokens_seen, train_losses, alpha=0)
-    ax2.set_xlabel("Tokens seen")
-
+    ax2.plot(tokens, train_losses, alpha=0)
+    ax2.set_xlabel("Tokens Processed")
     fig.tight_layout()
 
 
-def main(gpt_config, settings):
-
+def main(config, params, input_path):
     torch.manual_seed(123)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    file_path = "the-verdict.txt"
-    url = "https://raw.githubusercontent.com/rasbt/LLMs-from-scratch/main/ch02/01_main-chapter-code/the-verdict.txt"
+    if not os.path.exists(input_path):
+        raise FileNotFoundError(
+            f"Input file '{input_path}' not found. Please provide a valid file path."
+        )
 
-    if not os.path.exists(file_path):
-        with urllib.request.urlopen(url) as response:
-            text_data = response.read().decode("utf-8")
-        with open(file_path, "w", encoding="utf-8") as file:
-            file.write(text_data)
-    else:
-        with open(file_path, "r", encoding="utf-8") as file:
-            text_data = file.read()
+    with open(input_path, "r", encoding="utf-8") as file:
+        text_data = file.read()
 
-    model = GPTModel(gpt_config)
-    model.to(device)
+    model = LanguageModel(config).to(device)
     optimizer = torch.optim.AdamW(
         model.parameters(),
-        lr=settings["learning_rate"],
-        weight_decay=settings["weight_decay"],
+        lr=params["learning_rate"],
+        weight_decay=params["weight_decay"],
     )
 
-    train_ratio = 0.90
-    split_idx = int(train_ratio * len(text_data))
-
-    train_loader = create_dataloader_v1(
-        text_data[:split_idx],
-        batch_size=settings["batch_size"],
-        max_length=gpt_config["context_length"],
-        stride=gpt_config["context_length"],
-        drop_last=True,
-        shuffle=True,
+    train_loader = create_dataloader(
+        text_data[: int(0.9 * len(text_data))],
+        batch_size=params["batch_size"],
+        seq_length=config["context_length"],
+        step_size=config["context_length"],
+        shuffle_data=True,
+        drop_extra=True,
+        num_workers=0,
+    )
+    val_loader = create_dataloader(
+        text_data[int(0.9 * len(text_data)) :],
+        batch_size=params["batch_size"],
+        seq_length=config["context_length"],
+        step_size=config["context_length"],
+        shuffle_data=False,
+        drop_extra=False,
         num_workers=0,
     )
 
-    val_loader = create_dataloader_v1(
-        text_data[split_idx:],
-        batch_size=settings["batch_size"],
-        max_length=gpt_config["context_length"],
-        stride=gpt_config["context_length"],
-        drop_last=False,
-        shuffle=False,
-        num_workers=0,
-    )
-
-    tokenizer = tiktoken.get_encoding("gpt2")
-
-    train_losses, val_losses, tokens_seen = train_model_simple(
+    tokenizer = tiktoken.get_encoding(MODEL_TOKENS)
+    train_losses, val_losses, tokens_processed = train_model(
         model,
         train_loader,
         val_loader,
         optimizer,
         device,
-        num_epochs=settings["num_epochs"],
-        eval_freq=5,
-        eval_iter=1,
-        start_context="Every effort moves you",
+        epochs=params["num_epochs"],
+        eval_interval=5,
+        max_batches=1,
+        initial_text="Every effort moves you",
         tokenizer=tokenizer,
     )
-
-    return train_losses, val_losses, tokens_seen, model
+    return train_losses, val_losses, tokens_processed, model
 
 
 if __name__ == "__main__":
-
-    GPT_CONFIG_124M = {
-        "vocab_size": 50257,
-        "context_length": 256,
-        "emb_dim": 768,
-        "n_heads": 12,
-        "n_layers": 12,
-        "drop_rate": 0.1,
-        "qkv_bias": False,
-    }
-
-    OTHER_SETTINGS = {
-        "learning_rate": 5e-4,
-        "num_epochs": 10,
-        "batch_size": 2,
-        "weight_decay": 0.1,
-    }
-
-    train_losses, val_losses, tokens_seen, model = main(GPT_CONFIG_124M, OTHER_SETTINGS)
-
-    epochs_tensor = torch.linspace(0, OTHER_SETTINGS["num_epochs"], len(train_losses))
-    plot_losses(epochs_tensor, tokens_seen, train_losses, val_losses)
-    plt.savefig("loss.pdf")
-
+    args = parse_arguments()
+    if args.epochs:
+        TRAINING_PARAMETERS["num_epochs"] = args.epochs
+    train_losses, val_losses, tokens_processed, model = main(
+        MODEL_PARAMETERS, TRAINING_PARAMETERS, args.input_data
+    )
+    epochs = torch.linspace(0, TRAINING_PARAMETERS["num_epochs"], len(train_losses))
+    plot_training_results(epochs, tokens_processed, train_losses, val_losses)
+    plt.savefig("loss.png")
     torch.save(model.state_dict(), "model.pth")
-    model = GPTModel(GPT_CONFIG_124M)
-    model.load_state_dict(torch.load("model.pth"))

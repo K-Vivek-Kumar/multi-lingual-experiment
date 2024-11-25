@@ -1,25 +1,18 @@
 import torch
 import tiktoken
-from slm.model import GPTModel
-from train import generate_text_simple, text_to_token_ids, token_ids_to_text
 
 
-GPT_CONFIG_124M = {
-    "vocab_size": 50257,
-    "context_length": 256,
-    "emb_dim": 768,
-    "n_heads": 12,
-    "n_layers": 12,
-    "drop_rate": 0.1,
-    "qkv_bias": False,
-}
+from config import MODEL_PARAMETERS, MODEL_TOKENS
+from slm.generation import generate_text
+from slm.model import LanguageModel
+from slm.tokenizer import encode_text, decode_tokens
 
 
-tokenizer = tiktoken.get_encoding("gpt2")
+tokenizer = tiktoken.get_encoding(MODEL_TOKENS)
 
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-model = GPTModel(GPT_CONFIG_124M)
+model = LanguageModel(MODEL_PARAMETERS)
 model.to(device)
 
 
@@ -27,27 +20,28 @@ model.load_state_dict(torch.load("model.pth", weights_only=True))
 model.eval()
 
 
-start_context = "How he laughed?"
-
-
-encoded_context = text_to_token_ids(start_context, tokenizer).to(device)
-
-
-def generate_text(model, context, max_new_tokens=100, context_size=256):
-
-    token_ids = generate_text_simple(
+def generate(model, context, max_new_tokens=100, context_size=256):
+    token_ids = generate_text(
         model, context, max_new_tokens=max_new_tokens, context_size=context_size
     )
-
-    return token_ids_to_text(token_ids, tokenizer)
-
-
-generated_text = generate_text(
-    model,
-    encoded_context,
-    max_new_tokens=100,
-    context_size=GPT_CONFIG_124M["context_length"],
-)
+    return decode_tokens(token_ids, tokenizer)
 
 
-print(generated_text)
+while True:
+    user_input = input("Enter your prompt (or type 'exit' to quit): ")
+    if user_input.lower() == "exit":
+        print("Exiting the program.")
+        break
+
+    encoded_context = encode_text(user_input, tokenizer).to(device)
+
+    generated_response = generate(
+        model,
+        encoded_context,
+        max_new_tokens=100,
+        context_size=MODEL_PARAMETERS["context_length"],
+    )
+
+    print("\nGenerated Text:\n")
+    print(generated_response)
+    print("\n" + "=" * 50 + "\n")
