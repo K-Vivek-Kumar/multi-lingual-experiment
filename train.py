@@ -44,10 +44,11 @@ def create_dataloader(
 
 def compute_loss(inputs, targets, model, device):
     inputs, targets = inputs.to(device), targets.to(device)
-    predictions = model(inputs)
-    return torch.nn.functional.cross_entropy(
-        predictions.flatten(0, 1), targets.flatten()
+    all_logits = model(inputs)
+    final_loss = torch.nn.functional.cross_entropy(
+        all_logits[-1].flatten(0, 1), targets.flatten()
     )
+    return final_loss
 
 
 def evaluate_loss(data_loader, model, device, max_batches=None):
@@ -75,7 +76,11 @@ def generate_sample_text(model, tokenizer, device, initial_text):
     context_indices = encode_text(initial_text, tokenizer).to(device)
     with torch.no_grad():
         generated_tokens = generate_text(
-            model, context_indices, max_new_tokens=50, context_size=context_limit
+            model,
+            context_indices,
+            max_new_tokens=50,
+            context_size=context_limit,
+            tokenizer=tokenizer,
         )
         print(decode_tokens(generated_tokens, tokenizer).replace("\n", " "))
     model.train()

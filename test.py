@@ -22,7 +22,12 @@ model.eval()
 
 def generate(model, context, max_new_tokens=100, context_size=256):
     token_ids = generate_text(
-        model, context, max_new_tokens=max_new_tokens, context_size=context_size
+        model,
+        context,
+        max_new_tokens=max_new_tokens,
+        context_size=context_size,
+        tokenizer=tokenizer,
+        logits_file="logits.txt",
     )
     return decode_tokens(token_ids, tokenizer)
 
