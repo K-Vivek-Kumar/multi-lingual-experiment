@@ -117,7 +117,7 @@ def train_model(
                 val_losses.append(val_loss)
                 tokens_processed.append(total_tokens)
                 print(
-                    f"Epoch {epoch + 1}, Step {steps}: "
+                    f"Epoch {epoch + 1}"
                     f"Train Loss {train_loss:.3f}, Val Loss {val_loss:.3f}"
                 )
         generate_sample_text(model, tokenizer, device, initial_text)

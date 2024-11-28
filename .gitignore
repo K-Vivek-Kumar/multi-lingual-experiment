@@ -9,3 +9,4 @@ model.pth
 *.pth
 *.pkl
 *.png
+/models
