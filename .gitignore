@@ -5,7 +5,7 @@ datasets/translations/
 loss.pdf
 model.pth
 *.txt
-*.pdf
+loss.*
 *.pth
 *.pkl
 *.png
