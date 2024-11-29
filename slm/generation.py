@@ -24,7 +24,7 @@ def generate_text(
         decoded_token = tokenizer.decode([idx_next.item()])
 
         if file:
-            # file.write(f"Final Logits: {final_logits.squeeze().tolist()}\n")
+            file.write(f"Final Logits: {final_logits.squeeze().tolist()}\n")
             file.write(f"Generated token: {decoded_token}\n")
 
     if file:
